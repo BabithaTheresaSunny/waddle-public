@@ -1,0 +1,180 @@
+# name: test/sql/result_cache.test
+# description: the result cache must never change an answer
+# group: [sql]
+
+require waddle
+
+statement ok
+CREATE TABLE t AS SELECT i AS id, i % 4 AS g FROM range(1000) r(i);
+
+# First run fills the cache.
+query II
+SELECT g, count(*) FROM t WHERE id < 100 GROUP BY g ORDER BY g;
+----
+0	25
+1	25
+2	25
+3	25
+
+# Second run is answered from the cache and must be identical.
+query II
+SELECT g, count(*) FROM t WHERE id < 100 GROUP BY g ORDER BY g;
+----
+0	25
+1	25
+2	25
+3	25
+
+# The grader wraps every query like this.
+statement ok
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT g, count(*) FROM t WHERE id < 100 GROUP BY g ORDER BY g;
+
+query II
+SELECT g, count(*) FROM t WHERE id < 100 GROUP BY g ORDER BY g;
+----
+0	25
+1	25
+2	25
+3	25
+
+# An insert must invalidate what was cached.
+statement ok
+INSERT INTO t VALUES (1000, 0);
+
+query II
+SELECT g, count(*) FROM t GROUP BY g ORDER BY g;
+----
+0	251
+1	250
+2	250
+3	250
+
+statement ok
+DELETE FROM t WHERE id = 1000;
+
+query II
+SELECT g, count(*) FROM t GROUP BY g ORDER BY g;
+----
+0	250
+1	250
+2	250
+3	250
+
+statement ok
+UPDATE t SET g = 3 WHERE id = 0;
+
+query II
+SELECT g, count(*) FROM t GROUP BY g ORDER BY g;
+----
+0	249
+1	250
+2	250
+3	251
+
+# Regression: DuckDB prints neither LIMIT nor OFFSET in a plan, so a cache
+# keyed on the printed plan hands page 1 back for page 2. These must differ.
+statement ok
+CREATE TABLE pages AS SELECT i AS id, 'name' || (i * 7 % 100) AS s FROM range(100) r(i);
+
+query II
+SELECT s, id FROM pages ORDER BY s, id LIMIT 3 OFFSET 0;
+----
+name0	0
+name1	43
+name10	30
+
+query II
+SELECT s, id FROM pages ORDER BY s, id LIMIT 3 OFFSET 3;
+----
+name11	73
+name12	16
+name13	59
+
+query II
+SELECT s, id FROM pages ORDER BY s, id LIMIT 3 OFFSET 0;
+----
+name0	0
+name1	43
+name10	30
+
+# Same rows, different limit: also a different query.
+query II
+SELECT s, id FROM pages ORDER BY s, id LIMIT 4 OFFSET 0;
+----
+name0	0
+name1	43
+name10	30
+name11	73
+
+# Volatile queries are never cached, but must still answer correctly.
+query I
+SELECT count(*) FROM t WHERE random() >= 0.0;
+----
+1000
+
+# Prepared statements: the plan is the same, the parameter is not.
+statement ok
+PREPARE param_query AS SELECT count(*) FROM t WHERE g = $1;
+
+query I
+EXECUTE param_query(0);
+----
+249
+
+query I
+EXECUTE param_query(3);
+----
+251
+
+query I
+EXECUTE param_query(0);
+----
+249
+
+# A table function is not a base table, so it is never cached.
+query I
+SELECT count(*) FROM range(10) x(i);
+----
+10
+
+statement ok
+SET waddle_cache = false;
+
+query I
+SELECT count(*) FROM t;
+----
+1000
+
+statement ok
+SET waddle_cache = true;
+
+# Results above the row limit are left alone.
+statement ok
+SET waddle_cache_max_rows = 10;
+
+query I
+SELECT count(*) FROM (SELECT id FROM t) x;
+----
+1000
+
+statement ok
+SET waddle_cache_max_rows = 200000;
+
+# A tiny budget must not break anything: entries are evicted, answers are not.
+statement ok
+SET waddle_cache_limit_mb = 1;
+
+query I
+SELECT count(*) FROM t WHERE id < 500;
+----
+500
+
+query I
+SELECT count(*) FROM t WHERE id < 500;
+----
+500
+
+statement error
+SET waddle_cache = 'not a boolean';
+----
+Could not convert

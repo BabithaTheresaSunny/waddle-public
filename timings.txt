@@ -1,0 +1,24 @@
+bench-off    run 1     24.54 s total   geomean   34.76 ms   <- fastest
+Slowest 10 queries (fastest run)
+bench-on     run 1     20.27 s total   geomean   25.19 ms   <- fastest
+Slowest 10 queries (fastest run)
+bench-mid    run 0     21.56 s total   geomean   27.42 ms   <- fastest
+Slowest 10 queries (fastest run)
+bench-big    run 1     24.87 s total   geomean   30.13 ms   <- fastest
+Slowest 10 queries (fastest run)
+bench-off    run 0     29.56 s total   geomean   42.72 ms   <- fastest
+Slowest 10 queries (fastest run)
+bench-on     run 0     30.17 s total   geomean   33.69 ms   <- fastest
+Slowest 10 queries (fastest run)
+bench-mid    run 1     25.87 s total   geomean   32.63 ms   <- fastest
+Slowest 10 queries (fastest run)
+bench-big    run 1     27.68 s total   geomean   33.06 ms   <- fastest
+Slowest 10 queries (fastest run)
+bench-off    run 1     28.92 s total   geomean   39.07 ms   <- fastest
+Slowest 10 queries (fastest run)
+bench-on     run 0     27.30 s total   geomean   33.93 ms   <- fastest
+Slowest 10 queries (fastest run)
+bench-mid    run 1     25.87 s total   geomean   32.39 ms   <- fastest
+Slowest 10 queries (fastest run)
+bench-big    run 1     27.22 s total   geomean   33.06 ms   <- fastest
+Slowest 10 queries (fastest run)

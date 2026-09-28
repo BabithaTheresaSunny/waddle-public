@@ -8,3 +8,9 @@ test/python/__pycache__/
 .Rhistory
 /data
 __pycache__/
+bench-on/
+bench-off/
+bench-big/
+bench-mid/
+cache.log
+observe.log

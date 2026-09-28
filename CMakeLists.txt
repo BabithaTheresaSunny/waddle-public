@@ -13,7 +13,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(src/include)
 
-set(EXTENSION_SOURCES src/waddle_extension.cpp)
+set(EXTENSION_SOURCES
+    src/waddle_extension.cpp
+    src/plan_key.cpp
+    src/result_cache.cpp
+    src/cache_operators.cpp
+    src/recycler_optimizer.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
