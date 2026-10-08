@@ -1,0 +1,123 @@
+# name: test/sql/subtree_reuse.test
+# description: reusing a subtree shared by different queries must not change any answer
+# group: [sql]
+
+require waddle
+
+statement ok
+CREATE TABLE t AS SELECT i AS id, 1 + i % 4 AS kind_id, 2000 + i % 10 AS yr FROM range(100) r(i);
+
+statement ok
+CREATE TABLE k AS SELECT i AS id, 'k' || i AS kind FROM range(1, 5) r(i);
+
+statement ok
+CREATE TABLE c AS SELECT i AS id, i % 100 AS tid, i % 7 AS role FROM range(700) r(i);
+
+# These queries share one inner subtree (t joined to k, filtered on yr) and do
+# different work above it. The defaults only capture a subtree that cost real
+# work to produce; this data is tiny, so the floor comes down for the test.
+statement ok
+SET waddle_min_subtree_work = 100;
+
+statement ok
+SET waddle_min_subtree_operators = 3;
+
+query II
+SELECT x.kind, count(*) FROM (SELECT k.kind, t.id FROM t JOIN k ON k.id = t.kind_id WHERE t.yr > 2004) x JOIN c ON c.tid = x.id GROUP BY 1 ORDER BY 1;
+----
+k1	70
+k2	105
+k3	70
+k4	105
+
+query II
+SELECT x.kind, count(DISTINCT c.role) FROM (SELECT k.kind, t.id FROM t JOIN k ON k.id = t.kind_id WHERE t.yr > 2004) x JOIN c ON c.tid = x.id GROUP BY 1 ORDER BY 1;
+----
+k1	7
+k2	7
+k3	7
+k4	7
+
+# By now the inner subtree has been seen before, so it is captured, and the
+# queries below are the ones that may read it from the cache.
+query III
+SELECT x.kind, min(c.id), max(c.id) FROM (SELECT k.kind, t.id FROM t JOIN k ON k.id = t.kind_id WHERE t.yr > 2004) x JOIN c ON c.tid = x.id GROUP BY 1 ORDER BY 1;
+----
+k1	8	696
+k2	5	697
+k3	6	698
+k4	7	699
+
+# A column that comes out of the cached subtree, used in a filter and in an
+# expression above it: the swap has to rewrite those references.
+query II
+SELECT upper(x.kind), count(*) FROM (SELECT k.kind, t.id FROM t JOIN k ON k.id = t.kind_id WHERE t.yr > 2004) x JOIN c ON c.tid = x.id WHERE x.kind <> 'k2' GROUP BY 1 ORDER BY 1;
+----
+K1	70
+K3	70
+K4	105
+
+query I
+SELECT count(*) FROM (SELECT k.kind, t.id FROM t JOIN k ON k.id = t.kind_id WHERE t.yr > 2004) x;
+----
+50
+
+# The first query again, now answerable as a whole from the cache.
+query II
+SELECT x.kind, count(*) FROM (SELECT k.kind, t.id FROM t JOIN k ON k.id = t.kind_id WHERE t.yr > 2004) x JOIN c ON c.tid = x.id GROUP BY 1 ORDER BY 1;
+----
+k1	70
+k2	105
+k3	70
+k4	105
+
+# Writing to a table the cached subtree reads must invalidate it.
+statement ok
+INSERT INTO c VALUES (700, 5, 3);
+
+query II
+SELECT x.kind, count(*) FROM (SELECT k.kind, t.id FROM t JOIN k ON k.id = t.kind_id WHERE t.yr > 2004) x JOIN c ON c.tid = x.id GROUP BY 1 ORDER BY 1;
+----
+k1	70
+k2	106
+k3	70
+k4	105
+
+# LIMIT without an ordering picks arbitrary rows, so nothing below it is
+# reused: the answer must not depend on an order the cache happens to hold.
+query I
+SELECT count(*) FROM (SELECT x.kind FROM (SELECT k.kind, t.id FROM t JOIN k ON k.id = t.kind_id WHERE t.yr > 2004) x LIMIT 5) y;
+----
+5
+
+statement ok
+SET waddle_subtree_reuse = false;
+
+query II
+SELECT x.kind, count(*) FROM (SELECT k.kind, t.id FROM t JOIN k ON k.id = t.kind_id WHERE t.yr > 2004) x JOIN c ON c.tid = x.id GROUP BY 1 ORDER BY 1;
+----
+k1	70
+k2	106
+k3	70
+k4	105
+
+statement ok
+SET waddle_subtree_reuse = true;
+
+# A budget too small to hold anything: entries are evicted constantly, answers
+# are unaffected.
+statement ok
+SET waddle_cache_limit_mb = 1;
+
+query II
+SELECT x.kind, min(c.id) FROM (SELECT k.kind, t.id FROM t JOIN k ON k.id = t.kind_id WHERE t.yr > 2004) x JOIN c ON c.tid = x.id GROUP BY 1 ORDER BY 1;
+----
+k1	8
+k2	5
+k3	6
+k4	7
+
+statement error
+SET waddle_min_subtree_work = 'lots';
+----
+Could not convert

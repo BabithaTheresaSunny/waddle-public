@@ -2,6 +2,7 @@
 
 #include "cache_operators.hpp"
 #include "plan_key.hpp"
+#include "plan_rewrite.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -12,10 +13,14 @@
 
 namespace duckdb {
 
+//===--------------------------------------------------------------------===//
+// What may be cached
+//===--------------------------------------------------------------------===//
+
 //! Operators we understand well enough to promise that the same plan always
-//! produces the same rows. Anything not on this list makes the query
-//! uncacheable - an allowlist, so a new DuckDB operator we have never seen
-//! cannot quietly become a wrong answer.
+//! produces the same rows. Anything not on this list makes the plan
+//! uncacheable - an allowlist, so a DuckDB operator we have never seen cannot
+//! quietly become a wrong answer.
 static bool IsPureReadOperator(LogicalOperatorType type) {
 	switch (type) {
 	case LogicalOperatorType::LOGICAL_PROJECTION:
@@ -86,6 +91,33 @@ static bool ChangesDatabaseState(LogicalOperatorType type) {
 	}
 }
 
+//! Operators that read something produced elsewhere in the same plan. A
+//! subtree containing one of these is not self-contained: on its own it would
+//! have nothing to read from, so it can never be cached or replaced by itself.
+static bool DependsOnSurroundingPlan(LogicalOperatorType type) {
+	return type == LogicalOperatorType::LOGICAL_DELIM_GET || type == LogicalOperatorType::LOGICAL_CTE_REF;
+}
+
+//! Regions of a plan we leave alone when working below the root.
+//!
+//! LIMIT without an ordering picks an arbitrary set of rows, so the answer
+//! depends on the order its input arrives in. Replacing part of that input with
+//! cached rows would fix an order that a parallel run never guarantees, and the
+//! rows chosen could then differ from the ones vanilla DuckDB returned.
+//! Delimited joins and CTE bodies are tied by table index to operators outside
+//! the subtree, so swapping a piece of them is not a local change.
+static bool BlocksDescent(LogicalOperatorType type) {
+	switch (type) {
+	case LogicalOperatorType::LOGICAL_LIMIT:
+	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
+	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+	case LogicalOperatorType::LOGICAL_RECURSIVE_CTE:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static bool ExpressionsAreStable(LogicalOperator &op) {
 	bool stable = true;
 	LogicalOperatorVisitor::EnumerateExpressions(op, [&](unique_ptr<Expression> *child) {
@@ -103,8 +135,11 @@ static bool ExpressionsAreStable(LogicalOperator &op) {
 	return stable;
 }
 
-static bool IsCacheable(LogicalOperator &op) {
+static bool IsCacheable(LogicalOperator &op, bool allow_dependent) {
 	if (!IsPureReadOperator(op.type)) {
+		return false;
+	}
+	if (!allow_dependent && DependsOnSurroundingPlan(op.type)) {
 		return false;
 	}
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
@@ -118,7 +153,7 @@ static bool IsCacheable(LogicalOperator &op) {
 		return false;
 	}
 	for (auto &child : op.children) {
-		if (!IsCacheable(*child)) {
+		if (!IsCacheable(*child, allow_dependent)) {
 			return false;
 		}
 	}
@@ -137,38 +172,180 @@ static bool ChangesState(LogicalOperator &op) {
 	return false;
 }
 
+//===--------------------------------------------------------------------===//
+// Settings and logging
+//===--------------------------------------------------------------------===//
+
 static bool GetSetting(ClientContext &context, const string &name, Value &result) {
 	return context.TryGetCurrentSetting(name, result) && !result.IsNull();
 }
 
-static bool LoggingEnabled(ClientContext &context) {
+static bool BoolSetting(ClientContext &context, const string &name, bool fallback) {
 	Value value;
-	return GetSetting(context, "waddle_log", value) && value.GetValue<bool>();
+	return GetSetting(context, name, value) ? value.GetValue<bool>() : fallback;
+}
+
+static idx_t CountSetting(ClientContext &context, const string &name, idx_t fallback) {
+	Value value;
+	if (!GetSetting(context, name, value)) {
+		return fallback;
+	}
+	auto count = value.GetValue<int64_t>();
+	return count < 0 ? 0 : NumericCast<idx_t>(count);
 }
 
 static void Log(ClientContext &context, const string &message) {
-	if (LoggingEnabled(context)) {
+	if (BoolSetting(context, "waddle_log", false)) {
 		Printer::Print("[waddle] " + message);
 	}
 }
 
+//===--------------------------------------------------------------------===//
+// Reuse: find the largest cached subtree and swap it in
+//===--------------------------------------------------------------------===//
+
+struct ReuseResult {
+	bool replaced = false;
+	string what;
+	idx_t rows = 0;
+};
+
+static void TryReuse(unique_ptr<LogicalOperator> &slot, bool is_root, bool blocked, ResultCache &cache,
+                     Optimizer &optimizer, LogicalOperator &root, ReuseResult &result) {
+	if (result.replaced) {
+		return;
+	}
+	auto &op = *slot;
+	// The root of the query is always a candidate; below it we stay out of the
+	// regions BlocksDescent names.
+	if ((is_root || !blocked) && IsCacheable(op, is_root)) {
+		string key;
+		if (SerializePlan(op, key)) {
+			auto cached = cache.Lookup(HashPlanKey(key), key);
+			auto bindings = op.GetColumnBindings();
+			if (cached && cached->types == op.types && bindings.size() == op.types.size()) {
+				auto table_index = optimizer.binder.GenerateTableIndex();
+				result.replaced = true;
+				result.what = is_root ? "the whole query" : op.GetName();
+				result.rows = cached->data->Count();
+				slot = make_uniq<LogicalCachedScan>(cached, table_index);
+				// Everything above the swap still refers to columns the old
+				// subtree produced; point those at the cached scan instead.
+				if (!is_root) {
+					RemapColumnBindings(root, bindings, table_index);
+				}
+				return;
+			}
+		}
+	}
+	auto blocked_below = blocked || BlocksDescent(op.type);
+	for (auto &child : op.children) {
+		TryReuse(child, false, blocked_below, cache, optimizer, root, result);
+		if (result.replaced) {
+			return;
+		}
+	}
+}
+
+//===--------------------------------------------------------------------===//
+// Capture: pick what is worth remembering
+//===--------------------------------------------------------------------===//
+
+struct Candidate {
+	optional_ptr<unique_ptr<LogicalOperator>> slot;
+	string key;
+	hash_t fingerprint = 0;
+	idx_t operators = 0;
+	idx_t rows = 0;
+	idx_t work = 0;
+};
+
+//! Rows flowing through a subtree, as the optimizer estimates them: a rough
+//! stand-in for how much work the subtree does.
+static idx_t EstimatedWork(LogicalOperator &op, idx_t &operators) {
+	operators++;
+	idx_t work = op.has_estimated_cardinality ? op.estimated_cardinality : 0;
+	for (auto &child : op.children) {
+		work += EstimatedWork(*child, operators);
+	}
+	return work;
+}
+
+struct CandidateSearch {
+	idx_t root_row_limit;
+	idx_t subtree_row_limit;
+	idx_t min_operators;
+	idx_t min_work;
+	bool subtrees_enabled;
+	//! The whole query, kept whatever it looks like: its result is the answer
+	//! the next identical query needs, and it is the cheapest thing to store.
+	Candidate root;
+	//! Every subtree we could cache, in plan order.
+	vector<Candidate> subtrees;
+};
+
+static void CollectCandidates(unique_ptr<LogicalOperator> &slot, bool is_root, bool blocked, CandidateSearch &search) {
+	auto &op = *slot;
+	auto consider = is_root || (search.subtrees_enabled && !blocked);
+	if (consider && IsCacheable(op, is_root)) {
+		idx_t operators = 0;
+		auto work = EstimatedWork(op, operators);
+		auto rows = op.has_estimated_cardinality ? op.estimated_cardinality : NumericLimits<idx_t>::Maximum();
+		auto limit = is_root ? search.root_row_limit : search.subtree_row_limit;
+		auto worth_it = is_root || (operators >= search.min_operators && work >= search.min_work);
+		if (rows <= limit && worth_it) {
+			string key;
+			if (SerializePlan(op, key)) {
+				Candidate candidate;
+				candidate.slot = &slot;
+				candidate.fingerprint = HashPlanKey(key);
+				candidate.key = std::move(key);
+				candidate.operators = operators;
+				candidate.rows = rows;
+				candidate.work = work;
+				if (is_root) {
+					search.root = std::move(candidate);
+				} else {
+					search.subtrees.push_back(std::move(candidate));
+				}
+			}
+		}
+	}
+	auto blocked_below = blocked || BlocksDescent(op.type);
+	for (auto &child : op.children) {
+		CollectCandidates(child, false, blocked_below, search);
+	}
+}
+
+//! Wraps a plan, or part of one, so its rows are copied into the cache as the
+//! query runs. Pass-through, so nothing above it needs rewriting.
+static void WrapWithCapture(Candidate &candidate, shared_ptr<ResultCache> cache, idx_t max_bytes) {
+	auto &slot = *candidate.slot;
+	auto capture = make_uniq<LogicalCaptureResult>(std::move(cache), candidate.fingerprint,
+	                                               std::move(candidate.key), max_bytes);
+	capture->children.push_back(std::move(slot));
+	capture->ResolveOperatorTypes();
+	slot = std::move(capture);
+}
+
+//===--------------------------------------------------------------------===//
+// The hook
+//===--------------------------------------------------------------------===//
+
 static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
 	auto &state = static_cast<RecyclerState &>(*input.info);
 	auto &context = input.context;
+	auto &cache = *state.cache;
 
-	Value enabled;
-	if (!GetSetting(context, "waddle_cache", enabled) || !enabled.GetValue<bool>()) {
+	if (!BoolSetting(context, "waddle_cache", true)) {
 		return;
 	}
-	Value max_rows;
-	idx_t row_limit = 200000;
-	if (GetSetting(context, "waddle_cache_max_rows", max_rows)) {
-		row_limit = NumericCast<idx_t>(max_rows.GetValue<int64_t>());
-	}
-	Value limit_mb;
-	if (GetSetting(context, "waddle_cache_limit_mb", limit_mb)) {
-		state.cache->SetBudget(NumericCast<idx_t>(limit_mb.GetValue<int64_t>()) * 1024 * 1024);
-	}
+	cache.SetBudget(CountSetting(context, "waddle_cache_limit_mb", 512) * 1024 * 1024);
+	auto root_row_limit = CountSetting(context, "waddle_cache_max_rows", 200000);
+	auto subtree_row_limit = CountSetting(context, "waddle_subtree_max_rows", 200000);
+	auto min_operators = CountSetting(context, "waddle_min_subtree_operators", 4);
+	auto min_work = CountSetting(context, "waddle_min_subtree_work", 5000000);
+	auto subtrees_enabled = BoolSetting(context, "waddle_subtree_reuse", true);
 
 	// The grader wraps every query in EXPLAIN ANALYZE, so the query we care
 	// about may be the child of an EXPLAIN node. `slot` is the unique_ptr we
@@ -181,44 +358,70 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 	auto query_number = ++state.queries_seen;
 
 	if (ChangesState(query)) {
-		state.cache->Clear();
+		cache.Clear();
 		Log(context, StringUtil::Format("query %llu changes the database - cache emptied", query_number));
 		return;
 	}
-	if (!IsCacheable(query)) {
+
+	// 1. Can any part of this query be answered from something we already have?
+	// `blocked` starts out true when subtree reuse is off, so the search looks
+	// at the whole query only. Serializing every subtree of every plan is not
+	// free, and it is wasted work if nothing below the root can be reused.
+	ReuseResult reuse;
+	TryReuse(slot.get(), true, !subtrees_enabled, cache, input.optimizer, *plan, reuse);
+	if (reuse.replaced) {
+		Log(context, StringUtil::Format("query %llu reuses %s from cache (%llu rows)", query_number, reuse.what,
+		                                reuse.rows));
 		return;
 	}
 
-	string plan_key;
-	if (!SerializePlan(query, plan_key)) {
-		return;
-	}
-	auto fingerprint = HashPlanKey(plan_key);
+	// 2. Otherwise run it as usual, but keep a copy of what is worth keeping.
+	//    Every key is taken before anything is wrapped: a capture operator in
+	//    the plan would change the bytes a later query has to match.
+	CandidateSearch search;
+	search.root_row_limit = root_row_limit;
+	search.subtree_row_limit = subtree_row_limit;
+	search.min_operators = min_operators;
+	search.min_work = min_work;
+	search.subtrees_enabled = subtrees_enabled;
+	CollectCandidates(slot.get(), true, false, search);
 
-	auto cached = state.cache->Lookup(fingerprint, plan_key);
-	if (cached) {
-		auto table_index = input.optimizer.binder.GenerateTableIndex();
-		slot.get() = make_uniq<LogicalCachedScan>(std::move(cached), table_index);
-		Log(context, StringUtil::Format("query %llu answered from cache", query_number));
-		return;
+	// Of the subtrees we could keep, take the one that does the most work and
+	// that an earlier query already contained. Capturing a subtree costs real
+	// time twice over - it has to come back often enough to pay for itself, and
+	// it has to have been expensive to produce - so two conditions guard it:
+	// the subtree must have appeared in an earlier query, and the optimizer
+	// must think it processes at least `waddle_min_subtree_work` rows.
+	// Materialising a cheap intermediate is measurably slower than recomputing
+	// it: on a session whose shared part was a filtered scan feeding a much
+	// bigger join, capturing it cost ~18% on the geometric mean.
+	optional_ptr<Candidate> repeat;
+	for (auto &candidate : search.subtrees) {
+		auto sightings = state.RecordSighting(candidate.fingerprint);
+		if (sightings >= 1 && (!repeat || candidate.work > repeat->work)) {
+			repeat = &candidate;
+		}
 	}
 
-	// Copying a huge result costs more than recomputing it: measured on a
-	// 2.7M-row result, capturing made the first run ~3x slower while the
-	// replay saved only ~30%. Use the optimizer's own estimate to skip those.
-	if (query.has_estimated_cardinality && query.estimated_cardinality > row_limit) {
-		Log(context, StringUtil::Format("query %llu is too large to cache (estimated %llu rows)", query_number,
-		                                query.estimated_cardinality));
-		return;
+	auto max_bytes = cache.MaxEntryBytes();
+	string captured;
+	// The subtree first: wrapping the root afterwards does not move it.
+	if (repeat) {
+		captured += StringUtil::Format(" a repeated %s (%llu operators, ~%llu rows)", repeat->slot->get()->GetName(),
+		                               repeat->operators, repeat->rows);
+		WrapWithCapture(*repeat, state.cache, max_bytes);
+	}
+	if (search.root.slot) {
+		captured += StringUtil::Format(" the whole query (~%llu rows)", search.root.rows);
+		WrapWithCapture(search.root, state.cache, max_bytes);
 	}
 
-	// Not seen before: run it as usual, but keep a copy of the result.
-	auto capture = make_uniq<LogicalCaptureResult>(state.cache, fingerprint, plan_key, state.cache->MaxEntryBytes());
-	capture->children.push_back(std::move(slot.get()));
-	capture->ResolveOperatorTypes();
-	slot.get() = std::move(capture);
-	Log(context, StringUtil::Format("query %llu is new - capturing its result (%llu entries, %llu MB cached)",
-	                                query_number, state.cache->EntryCount(), state.cache->BytesUsed() / 1024 / 1024));
+	if (captured.empty()) {
+		Log(context, StringUtil::Format("query %llu is new - nothing worth caching", query_number));
+	} else {
+		Log(context, StringUtil::Format("query %llu is new - capturing%s (%llu entries, %llu MB cached)", query_number,
+		                                captured, cache.EntryCount(), cache.BytesUsed() / 1024 / 1024));
+	}
 }
 
 OptimizerExtension CreateRecyclerOptimizer() {

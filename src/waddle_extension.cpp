@@ -9,12 +9,21 @@ namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
-	config.AddExtensionOption("waddle_cache", "Reuse the result of a query that has run before",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption("waddle_cache", "Reuse results computed earlier in this session", LogicalType::BOOLEAN,
+	                          Value::BOOLEAN(true));
 	config.AddExtensionOption("waddle_cache_limit_mb", "Memory the result cache may use, in MB", LogicalType::BIGINT,
 	                          Value::BIGINT(512));
-	config.AddExtensionOption("waddle_cache_max_rows", "Largest result (in rows) worth caching", LogicalType::BIGINT,
-	                          Value::BIGINT(200000));
+	config.AddExtensionOption("waddle_cache_max_rows", "Largest whole-query result worth caching, in rows",
+	                          LogicalType::BIGINT, Value::BIGINT(200000));
+	config.AddExtensionOption("waddle_subtree_reuse", "Also cache and reuse subtrees shared between queries",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption("waddle_subtree_max_rows", "Largest subtree result worth caching, in rows",
+	                          LogicalType::BIGINT, Value::BIGINT(200000));
+	config.AddExtensionOption("waddle_min_subtree_operators", "Smallest subtree worth caching, in operators",
+	                          LogicalType::BIGINT, Value::BIGINT(4));
+	config.AddExtensionOption("waddle_min_subtree_work",
+	                          "Smallest subtree worth caching, in estimated rows processed inside it",
+	                          LogicalType::BIGINT, Value::BIGINT(5000000));
 	config.AddExtensionOption("waddle_log", "Print what the recycler does with each query", LogicalType::BOOLEAN,
 	                          Value::BOOLEAN(false));
 	OptimizerExtension::Register(config, CreateRecyclerOptimizer());

@@ -24,6 +24,13 @@ void ResultCache::Insert(hash_t fingerprint, string plan_key, vector<LogicalType
 	}
 	auto existing = entries.find(fingerprint);
 	if (existing != entries.end()) {
+		if (existing->second->plan_key == plan_key) {
+			// We already have this exact result. DuckDB can execute the same
+			// operator more than once within one query - a second run may see
+			// no rows at all - so the first complete capture is the one we
+			// keep, and a later one is never allowed to replace it.
+			return;
+		}
 		// Same fingerprint, different plan: keep the newer result.
 		bytes_used -= existing->second->bytes;
 		entries.erase(existing);

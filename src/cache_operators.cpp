@@ -17,7 +17,7 @@ public:
 	unique_ptr<ColumnDataCollection> data;
 	ColumnDataAppendState append_state;
 	//! Set when the result outgrew the budget: we stop copying and give up on
-	//! caching this query, but the query itself runs on untouched.
+	//! caching this plan, but the query itself runs on untouched.
 	bool gave_up = false;
 };
 
@@ -40,13 +40,16 @@ public:
 		return "CAPTURE_RESULT";
 	}
 
+	// ParallelOperator() stays false (the default): one thread runs this
+	// operator, so rows are appended in a single, reproducible order. The price
+	// is that the pipeline this operator sits in is not parallelised.
 	unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context) const override {
 		auto state = make_uniq<CaptureState>();
 		// Deliberately NOT the buffer manager: cached results outlive the query
 		// that made them, and DuckDB tears the buffer manager down before
-		// extension state, which would leave the cache pointing at freed blocks.
-		// The cost is that these bytes sit outside memory_limit, which is why the
-		// cache keeps its own budget.
+		// extension state, which would leave the cache pointing at freed
+		// blocks. The cost is that these bytes sit outside memory_limit, which
+		// is why the cache keeps its own budget.
 		state->data = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), types);
 		state->data->InitializeAppend(state->append_state);
 		return std::move(state);
@@ -62,7 +65,7 @@ public:
 				state.data.reset();
 			}
 		}
-		// The rows still flow to whoever asked for them, untouched.
+		// The rows still flow onwards, untouched.
 		chunk.Reference(input);
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
@@ -72,11 +75,20 @@ public:
 	}
 
 	//! Called once, after the last row has passed through. Reaching this point
-	//! means the query ran to completion, so the copy is a complete result.
+	//! means the plan below ran to completion, so the copy is a complete result.
+	//! Called once, after the last row has passed through. Reaching this point
+	//! means the plan below ran to completion, so the copy is a complete
+	//! result.
 	OperatorFinalizeResultType FinalExecute(ExecutionContext &context, DataChunk &chunk, GlobalOperatorState &gstate,
 	                                        OperatorState &state_p) const override {
 		auto &state = state_p.Cast<CaptureState>();
-		if (!state.gave_up && state.data) {
+		// An empty copy is never published. DuckDB sometimes runs the same
+		// operator a second time within one query, and that run can see no
+		// rows at all; publishing it would replace a complete result with
+		// nothing. A subtree that genuinely returns no rows is cheap to
+		// recompute, so skipping those costs nothing. The cache also keeps the
+		// first result stored under a key, so a later run cannot overwrite it.
+		if (!state.gave_up && state.data && state.data->Count() > 0) {
 			shared_ptr<ColumnDataCollection> data = std::move(state.data);
 			cache->Insert(fingerprint, plan_key, types, std::move(data));
 		}
@@ -95,6 +107,8 @@ void LogicalCaptureResult::ResolveTypes() {
 }
 
 vector<ColumnBinding> LogicalCaptureResult::GetColumnBindings() {
+	// Pass-through: the rows above see exactly the columns the child produced,
+	// so nothing above this operator needs rewriting.
 	return children[0]->GetColumnBindings();
 }
 
@@ -108,8 +122,8 @@ string LogicalCaptureResult::GetExtensionName() const {
 
 PhysicalOperator &LogicalCaptureResult::CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) {
 	auto &child = planner.CreatePlan(*children[0]);
-	auto &op = planner.Make<PhysicalCaptureResult>(types, estimated_cardinality, cache, fingerprint, plan_key,
-	                                               max_bytes);
+	auto &op =
+	    planner.Make<PhysicalCaptureResult>(types, estimated_cardinality, cache, fingerprint, plan_key, max_bytes);
 	op.children.push_back(child);
 	return op;
 }
