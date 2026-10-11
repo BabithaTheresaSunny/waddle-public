@@ -222,6 +222,13 @@ static void TryReuse(unique_ptr<LogicalOperator> &slot, bool is_root, bool block
 		string key;
 		if (SerializePlan(op, key)) {
 			auto cached = cache.Lookup(HashPlanKey(key), key);
+			if (cached) {
+				// The optimizers can leave an operator's types empty: DuckDB only
+				// resolves them when it builds the physical plan. Without this the
+				// check below compares against an empty list and every hit on such
+				// a plan is thrown away.
+				op.ResolveOperatorTypes();
+			}
 			auto bindings = op.GetColumnBindings();
 			if (cached && cached->types == op.types && bindings.size() == op.types.size()) {
 				auto table_index = optimizer.binder.GenerateTableIndex();
@@ -272,7 +279,6 @@ static idx_t EstimatedWork(LogicalOperator &op, idx_t &operators) {
 }
 
 struct CandidateSearch {
-	idx_t root_row_limit;
 	idx_t subtree_row_limit;
 	idx_t min_operators;
 	idx_t min_work;
@@ -291,9 +297,13 @@ static void CollectCandidates(unique_ptr<LogicalOperator> &slot, bool is_root, b
 		idx_t operators = 0;
 		auto work = EstimatedWork(op, operators);
 		auto rows = op.has_estimated_cardinality ? op.estimated_cardinality : NumericLimits<idx_t>::Maximum();
-		auto limit = is_root ? search.root_row_limit : search.subtree_row_limit;
+		// The whole query is not judged by its estimate. The estimate of a
+		// grouped aggregate is simply the size of its input, so a query that
+		// returns a few thousand groups can look like hundreds of thousands of
+		// rows; the capture operator enforces the row limit on the real result.
+		auto within_limit = is_root || rows <= search.subtree_row_limit;
 		auto worth_it = is_root || (operators >= search.min_operators && work >= search.min_work);
-		if (rows <= limit && worth_it) {
+		if (within_limit && worth_it) {
 			string key;
 			if (SerializePlan(op, key)) {
 				Candidate candidate;
@@ -319,10 +329,10 @@ static void CollectCandidates(unique_ptr<LogicalOperator> &slot, bool is_root, b
 
 //! Wraps a plan, or part of one, so its rows are copied into the cache as the
 //! query runs. Pass-through, so nothing above it needs rewriting.
-static void WrapWithCapture(Candidate &candidate, shared_ptr<ResultCache> cache, idx_t max_bytes) {
+static void WrapWithCapture(Candidate &candidate, shared_ptr<ResultCache> cache, idx_t max_bytes, idx_t max_rows) {
 	auto &slot = *candidate.slot;
 	auto capture = make_uniq<LogicalCaptureResult>(std::move(cache), candidate.fingerprint,
-	                                               std::move(candidate.key), max_bytes);
+	                                               std::move(candidate.key), max_bytes, max_rows);
 	capture->children.push_back(std::move(slot));
 	capture->ResolveOperatorTypes();
 	slot = std::move(capture);
@@ -379,7 +389,6 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 	//    Every key is taken before anything is wrapped: a capture operator in
 	//    the plan would change the bytes a later query has to match.
 	CandidateSearch search;
-	search.root_row_limit = root_row_limit;
 	search.subtree_row_limit = subtree_row_limit;
 	search.min_operators = min_operators;
 	search.min_work = min_work;
@@ -409,11 +418,11 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 	if (repeat) {
 		captured += StringUtil::Format(" a repeated %s (%llu operators, ~%llu rows)", repeat->slot->get()->GetName(),
 		                               repeat->operators, repeat->rows);
-		WrapWithCapture(*repeat, state.cache, max_bytes);
+		WrapWithCapture(*repeat, state.cache, max_bytes, subtree_row_limit);
 	}
 	if (search.root.slot) {
 		captured += StringUtil::Format(" the whole query (~%llu rows)", search.root.rows);
-		WrapWithCapture(search.root, state.cache, max_bytes);
+		WrapWithCapture(search.root, state.cache, max_bytes, root_row_limit);
 	}
 
 	if (captured.empty()) {

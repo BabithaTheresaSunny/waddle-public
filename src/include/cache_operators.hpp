@@ -8,15 +8,17 @@ namespace duckdb {
 //! Sits on top of a plan (or of one subtree of a plan) whose result we want to
 //! remember. It passes every row through unchanged and keeps a copy; when the
 //! query finishes, the copy goes into the cache. If the copy grows past
-//! `max_bytes` it is dropped and the query is simply not cached.
+//! `max_bytes` or `max_rows` it is dropped and the query is simply not cached.
 class LogicalCaptureResult : public LogicalExtensionOperator {
 public:
-	LogicalCaptureResult(shared_ptr<ResultCache> cache, hash_t fingerprint, string plan_key, idx_t max_bytes);
+	LogicalCaptureResult(shared_ptr<ResultCache> cache, hash_t fingerprint, string plan_key, idx_t max_bytes,
+	                     idx_t max_rows);
 
 	shared_ptr<ResultCache> cache;
 	hash_t fingerprint;
 	string plan_key;
 	idx_t max_bytes;
+	idx_t max_rows;
 
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
 	string GetName() const override;

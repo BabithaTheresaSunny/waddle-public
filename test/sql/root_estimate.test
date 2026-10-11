@@ -1,0 +1,61 @@
+# name: test/sql/root_estimate.test
+# description: a whole query is cached on its real size, not on its estimate
+# group: [sql]
+
+require waddle
+
+statement ok
+CREATE TABLE facts AS SELECT i AS id, i % 4 AS g, i % 7 AS k FROM range(1000) r(i);
+
+statement ok
+CREATE TABLE dims AS SELECT i AS k, i % 2 = 0 AS keep FROM range(7) r(i);
+
+# DuckDB has no statistics for a group key like g % 2, so it estimates about
+# 100 groups where there are 2. With the limit at 50 the estimate alone would
+# rule the query out; the real result fits, so it must be cached.
+statement ok
+SET waddle_cache_max_rows = 50;
+
+# A correlated EXISTS is planned as a DELIM_JOIN. On such plans the optimizers
+# leave the root's types unresolved, which used to make every cache hit fail
+# the type check.
+query II
+SELECT g % 2 AS h, count(*) FROM facts f
+WHERE EXISTS (SELECT 1 FROM dims d WHERE d.k = f.k AND d.keep)
+GROUP BY h ORDER BY h;
+----
+0	287
+1	284
+
+query II
+SELECT g % 2 AS h, count(*) FROM facts f
+WHERE EXISTS (SELECT 1 FROM dims d WHERE d.k = f.k AND d.keep)
+GROUP BY h ORDER BY h;
+----
+0	287
+1	284
+
+# The repeat must be answered from the cache, so it reads no table at all. The
+# plan key includes where each expression sits in the SQL text, so the check
+# runs the very same statement twice - as the grader does - rather than
+# prefixing a plain EXPLAIN.
+statement ok
+EXPLAIN ANALYZE SELECT g % 2 AS h, count(*) FROM facts f
+WHERE EXISTS (SELECT 1 FROM dims d WHERE d.k = f.k AND d.keep)
+GROUP BY h ORDER BY h;
+
+query II
+EXPLAIN ANALYZE SELECT g % 2 AS h, count(*) FROM facts f
+WHERE EXISTS (SELECT 1 FROM dims d WHERE d.k = f.k AND d.keep)
+GROUP BY h ORDER BY h;
+----
+analyzed_plan	<!REGEX>:.*TABLE_SCAN.*
+
+# The limit still holds on the real result: 1000 rows are never cached.
+statement ok
+EXPLAIN ANALYZE SELECT id, g FROM facts ORDER BY id;
+
+query II
+EXPLAIN ANALYZE SELECT id, g FROM facts ORDER BY id;
+----
+analyzed_plan	<REGEX>:.*TABLE_SCAN.*

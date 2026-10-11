@@ -26,15 +26,17 @@ public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
 
 	PhysicalCaptureResult(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
-	                      shared_ptr<ResultCache> cache, hash_t fingerprint, string plan_key, idx_t max_bytes)
+	                      shared_ptr<ResultCache> cache, hash_t fingerprint, string plan_key, idx_t max_bytes,
+	                      idx_t max_rows)
 	    : PhysicalOperator(physical_plan, TYPE, std::move(types), estimated_cardinality), cache(std::move(cache)),
-	      fingerprint(fingerprint), plan_key(std::move(plan_key)), max_bytes(max_bytes) {
+	      fingerprint(fingerprint), plan_key(std::move(plan_key)), max_bytes(max_bytes), max_rows(max_rows) {
 	}
 
 	shared_ptr<ResultCache> cache;
 	hash_t fingerprint;
 	string plan_key;
 	idx_t max_bytes;
+	idx_t max_rows;
 
 	string GetName() const override {
 		return "CAPTURE_RESULT";
@@ -60,7 +62,7 @@ public:
 		auto &state = state_p.Cast<CaptureState>();
 		if (!state.gave_up) {
 			state.data->Append(state.append_state, input);
-			if (state.data->AllocationSize() > max_bytes) {
+			if (state.data->AllocationSize() > max_bytes || state.data->Count() > max_rows) {
 				state.gave_up = true;
 				state.data.reset();
 			}
@@ -98,8 +100,9 @@ public:
 };
 
 LogicalCaptureResult::LogicalCaptureResult(shared_ptr<ResultCache> cache_p, hash_t fingerprint_p, string plan_key_p,
-                                           idx_t max_bytes_p)
-    : cache(std::move(cache_p)), fingerprint(fingerprint_p), plan_key(std::move(plan_key_p)), max_bytes(max_bytes_p) {
+                                           idx_t max_bytes_p, idx_t max_rows_p)
+    : cache(std::move(cache_p)), fingerprint(fingerprint_p), plan_key(std::move(plan_key_p)), max_bytes(max_bytes_p),
+      max_rows(max_rows_p) {
 }
 
 void LogicalCaptureResult::ResolveTypes() {
@@ -122,8 +125,8 @@ string LogicalCaptureResult::GetExtensionName() const {
 
 PhysicalOperator &LogicalCaptureResult::CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) {
 	auto &child = planner.CreatePlan(*children[0]);
-	auto &op =
-	    planner.Make<PhysicalCaptureResult>(types, estimated_cardinality, cache, fingerprint, plan_key, max_bytes);
+	auto &op = planner.Make<PhysicalCaptureResult>(types, estimated_cardinality, cache, fingerprint, plan_key, max_bytes,
+	                                               max_rows);
 	op.children.push_back(child);
 	return op;
 }
